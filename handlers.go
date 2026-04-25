@@ -14,13 +14,24 @@ import (
 func (s *Sidecar) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/registerKey", s.handleRegisterKey)
-	mux.HandleFunc("GET /api/services", s.handleServices)
-	mux.HandleFunc("GET /api/pods", s.handlePods)
-	mux.HandleFunc("GET /api/keys", s.handleKeys)
-	mux.HandleFunc("POST /api/pod/get", s.handlePodGet)
-	mux.HandleFunc("POST /api/refresh", s.handleRefresh)
+	mux.HandleFunc("GET /api/services", s.requireReady(s.handleServices))
+	mux.HandleFunc("GET /api/pods", s.requireReady(s.handlePods))
+	mux.HandleFunc("GET /api/keys", s.requireReady(s.handleKeys))
+	mux.HandleFunc("POST /api/pod/get", s.requireReady(s.handlePodGet))
+	mux.HandleFunc("POST /api/refresh", s.requireReady(s.handleRefresh))
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	return mux
+}
+
+func (s *Sidecar) requireReady(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.IsReady() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "sidecar not connected to app yet"})
+			return
+		}
+		next(w, r)
+	}
 }
 
 // --- registerKey: app registers a cached key ---
@@ -32,6 +43,12 @@ type RegisterKeyReq struct {
 }
 
 func (s *Sidecar) handleRegisterKey(w http.ResponseWriter, r *http.Request) {
+	if !s.IsReady() {
+		// accept silently — don't break the app, keys will re-register later
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
 	var req RegisterKeyReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -296,22 +313,13 @@ func (s *Sidecar) handleRefresh(w http.ResponseWriter, r *http.Request) {
 // --- health ---
 
 func (s *Sidecar) handleHealth(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	redisOK := s.Redis.Ping(r.Context()).Err() == nil
+	appReady := s.IsReady()
 
-	redisOK := s.Redis.Ping(ctx).Err() == nil
-	appResp, appErr := s.HTTP.Get(s.Config.AppURL + "/internal/inMem/serverInfo")
-	appOK := appErr == nil && appResp.StatusCode == 200
-	if appResp != nil {
-		appResp.Body.Close()
-	}
-
-	status := http.StatusOK
-	if !redisOK || !appOK {
-		status = http.StatusServiceUnavailable
-	}
-	w.WriteHeader(status)
+	// sidecar is always alive (for k8s liveness), but reports readiness status
+	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{
 		"redis": redisOK,
-		"app":   appOK,
+		"app":   appReady,
 	})
 }
